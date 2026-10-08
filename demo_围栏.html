@@ -1,0 +1,254 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>牧界云 · 电子围栏 Demo（模拟版）</title>
+<!-- Leaflet 地图库（国内 CDN，无需注册任何 Key 即可运行） -->
+<link rel="stylesheet" href="https://cdn.bootcdn.net/ajax/libs/leaflet/1.9.4/leaflet.min.css">
+<script src="https://cdn.bootcdn.net/ajax/libs/leaflet/1.9.4/leaflet.min.js"></script>
+<style>
+  html, body { margin: 0; height: 100%; font-family: "Microsoft YaHei", sans-serif; }
+  #map { width: 100%; height: 100%; }
+  /* 右侧统计面板 */
+  #panel {
+    position: fixed; top: 10px; right: 10px; width: 240px; z-index: 1000;
+    background: rgba(255,255,255,.95); border-radius: 8px; padding: 12px;
+    box-shadow: 0 2px 10px rgba(0,0,0,.2); font-size: 13px;
+  }
+  #panel h3 { margin: 0 0 8px; font-size: 15px; }
+  #panel .stat { display: flex; justify-content: space-between; margin: 4px 0; }
+  #panel .safe { color: #1a7f37; font-weight: bold; }
+  #panel .out { color: #cf222e; font-weight: bold; }
+  #panel button {
+    width: 100%; margin-top: 8px; padding: 6px 0; border: none; border-radius: 5px;
+    background: #2b6cb0; color: #fff; font-size: 13px; cursor: pointer;
+  }
+  #panel button:hover { background: #225d94; }
+  #panel .hint { color: #666; font-size: 12px; margin-top: 8px; }
+  #alerts { max-height: 150px; overflow-y: auto; margin-top: 6px; font-size: 12px; color: #cf222e; }
+  /* 顶部标题 */
+  #title {
+    position: fixed; top: 10px; left: 10px; z-index: 1000; background: rgba(255,255,255,.92);
+    padding: 8px 14px; border-radius: 8px; box-shadow: 0 2px 8px rgba(0,0,0,.15); font-size: 14px;
+  }
+</style>
+</head>
+<body>
+<div id="title">🐄 牧界云 · 奶牛电子围栏 Demo（定位 + 虚拟围栏 + 越界告警）</div>
+<div id="map"></div>
+
+<div id="panel">
+  <h3>牛群状态（模拟 14 头）</h3>
+  <div class="stat"><span>总牛数</span><span id="total">14</span></div>
+  <div class="stat"><span>✅ 围栏内（安全）</span><span class="safe" id="safe">0</span></div>
+  <div class="stat"><span>🚨 越界</span><span class="out" id="outnum">0</span></div>
+  <button id="btnDraw">✏️ 重新画围栏（点地图加顶点，双击闭合）</button>
+  <button id="btnReset">🔁 重置围栏（恢复默认）</button>
+  <button id="btnPause">⏸ 暂停牛群移动</button>
+  <div id="alerts"></div>
+  <div class="hint">说明：点击牛标记可查看编号/坐标/状态。牛出圈后会变红并告警 —— 这就是学长项目里"越界检测"的最小实现。</div>
+</div>
+
+<script>
+// ============================================================
+// 牧界云 · 电子围栏 Demo（模拟版）
+// 思路与实验室项目一致：定位 -> 地图显示 -> 画围栏 -> 越界判断 -> 告警
+// 核心技术：射线法判断 "点是否在任意多边形内"（见 checkInside 函数）
+// 无需后端：牛的坐标是模拟的（真实系统里来自项圈的 GPS 上报）
+// ============================================================
+
+// ---- 1. 初始化地图（底图用 OpenStreetMap，免费无需 Key）----
+var map = L.map('map').setView([45.77, 126.60], 13); // 地图中心：哈尔滨附近
+L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', {
+    maxZoom: 19,
+    attribution: '&copy; OpenStreetMap'
+}).addTo(map);
+
+// ---- 2. 数据定义 -------------------------------------------
+var fencePoints = null;        // 围栏顶点（经纬度数组）
+var fenceLayer = null;         // 围栏图层
+var cows = [];                 // 牛数组
+var drawing = false;           // 是否在画围栏
+var drawPoints = [];           // 画围栏时的临时顶点
+var paused = false;
+
+// 模拟 14 头牛的起始位置（围绕默认围栏中心散开）
+var COW_COUNT = 14;
+var DEFAULT_FENCE = [
+  [45.7700, 126.5900], [45.7720, 126.6060],
+  [45.7660, 126.6120], [45.7610, 126.6030],
+  [45.7645, 126.5940]
+];
+var center = [45.7685, 126.6010];
+
+// 每条牛的属性：编号、位置、移动方向(用一个小角度扰动)
+// 初始都放在围栏内部附近，动画过程中会逐渐有牛走出围栏，演示效果更自然
+for (var i = 0; i < COW_COUNT; i++) {
+  var ang = (i / COW_COUNT) * Math.PI * 2;
+  var r = 0.0008 + 0.0020 * (i % 3);          // 初始半径：全部在围栏内
+  cows.push({
+    id: 'HL' + String(100 + i + 1),          // 编号：HL101~HL114
+    lat: center[0] + r * Math.cos(ang),
+    lng: center[1] + r * Math.sin(ang),
+    heading: Math.random() * Math.PI * 2,    // 随机方向
+    speed: 0.00006 + 0.00005 * Math.random(), // 移动速度（度/帧）
+    marker: null,                            // 地图标记
+    out: false                               // 是否越界
+  });
+}
+
+// ---- 3. 核心算法：射线法判断点是否在多边形内 ---------------
+// 思路：从该点向右画一条水平射线，统计它与多边形边界相交的次数。
+//       次数为奇数 => 点在多边形内；偶数 => 在外。
+// 这是 GIS 里最经典的"点在多边形内"算法，学长的越界检测原理相同。
+function checkInside(point, poly) {
+  var x = point.lng, y = point.lat;
+  var inside = false;
+  for (var i = 0, j = poly.length - 1; i < poly.length; j = i++) {
+    var xi = poly[i][1], yi = poly[i][0];   // 顶点 i
+    var xj = poly[j][1], yj = poly[j][0];   // 顶点 j（上一条边）
+    var intersect = ((yi > y) !== (yj > y)) &&
+      (x < (xj - xi) * (y - yi) / (yj - yi) + xi);
+    if (intersect) inside = !inside;
+  }
+  return inside;
+}
+
+// ---- 4. 画围栏 ---------------------------------------------
+function drawFence(pts, color) {
+  if (fenceLayer) map.removeLayer(fenceLayer);
+  if (!pts || pts.length < 3) return;
+  fenceLayer = L.polygon(pts, {
+    color: color || '#2b6cb0',   // 边框色
+    fillColor: '#2b6cb0',
+    fillOpacity: 0.15
+  }).addTo(map);
+  map.fitBounds(fenceLayer.getBounds().pad(0.2));
+}
+
+function restoreDefaultFence() {
+  fencePoints = DEFAULT_FENCE.slice();
+  drawFence(fencePoints);
+  updateAllCows();
+}
+
+// ---- 5. 创建/更新牛的标记 ----------------------------------
+function createCowMarkers() {
+  cows.forEach(function (cow) {
+    var icon = L.divIcon({
+      className: '',
+      html: '<div style="width:24px;height:24px;border-radius:50%;background:#1a7f37;color:#fff;' +
+            'display:flex;align-items:center;justify-content:center;font-size:11px;border:2px solid #fff;' +
+            'box-shadow:0 1px 4px rgba(0,0,0,.4);">🐄</div>',
+      iconSize: [24, 24], iconAnchor: [12, 12]
+    });
+    cow.marker = L.marker([cow.lat, cow.lng], { icon: icon }).addTo(map);
+    cow.marker.bindPopup(
+      "编号: " + cow.id + "<br>坐标: " + cow.lat.toFixed(5) + ", " + cow.lng.toFixed(5) +
+      "<br>状态: " + (cow.out ? "🚨 越界" : "✅ 安全")
+    );
+  });
+}
+
+// ---- 6. 越界检测 + 刷新显示 ---------------------------------
+function updateAllCows() {
+  var safeN = 0, outN = 0;
+  cows.forEach(function (cow, idx) {
+    if (!cow.marker) return;   // 标记尚未创建时跳过（初始化顺序保护）
+    var inside = fencePoints ? checkInside({ lng: cow.lng, lat: cow.lat }, fencePoints) : true;
+    cow.out = !inside;
+    if (cow.out) outN++; else safeN++;
+    // 越界的牛标记变红
+    cow.marker.setIcon(L.divIcon({
+      className: '',
+      html: '<div style="width:24px;height:24px;border-radius:50%;background:' + (cow.out ? '#cf222e' : '#1a7f37') +
+            ';color:#fff;display:flex;align-items:center;justify-content:center;font-size:11px;' +
+            'border:2px solid #fff;box-shadow:0 1px 4px rgba(0,0,0,.4);">🐄</div>',
+      iconSize: [24, 24], iconAnchor: [12, 12]
+    }));
+  });
+  document.getElementById('safe').textContent = safeN;
+  document.getElementById('outnum').textContent = outN;
+}
+
+// ---- 7. 牛群移动（模拟项圈每秒上报定位）--------------------
+function moveCows() {
+  if (paused) return;
+  cows.forEach(function (cow) {
+    // 小角度随机转向，走得更自然
+    cow.heading += (Math.random() - 0.5) * 0.6;
+    var step = cow.speed;
+    // 离开中心太远就往回走（防止牛跑到几十公里外）
+    var dLat = cow.lat - center[0], dLng = cow.lng - center[1];
+    var dist = Math.sqrt(dLat * dLat + dLng * dLng);
+    if (dist > 0.012) {
+      cow.heading = Math.atan2(center[1] - cow.lng, center[0] - cow.lat);
+    }
+    cow.lat += step * Math.sin(cow.heading);
+    cow.lng += step * Math.cos(cow.heading);
+    cow.marker.setLatLng([cow.lat, cow.lng]);
+  });
+  // 逐头判断越界（真实系统里每头牛的位置都是由服务器判断的，这里在浏览器里做同样的事）
+  var before = cows.filter(function (c) { return c.out; }).length;
+  updateAllCows();
+  var after = cows.filter(function (c) { return c.out; }).length;
+  addAlert(before, after);
+}
+
+// 告警列表：只在越界数变多时提示（避免刷屏）
+function addAlert(before, after) {
+  if (after > before) {
+    var box = document.getElementById('alerts');
+    var t = new Date().toLocaleTimeString();
+    box.innerHTML = '<div>' + t + ' 🚨 检测到新越界！当前越界 ' + after + ' 头</div>' + box.innerHTML;
+  }
+}
+
+// ---- 8. 画围栏交互（点地图加顶点，双击闭合）-----------------
+function startDrawing() {
+  drawing = true;
+  drawPoints = [];
+  document.getElementById('btnDraw').textContent = '🖱 在地图上点选顶点…（双击完成）';
+  map.on('click', onMapClick);
+  map.on('dblclick', onMapDblClick);
+}
+function onMapClick(e) {
+  drawPoints.push([e.latlng.lat, e.latlng.lng]);
+  // 顺便显示一个顶点小圆点（调试用）
+  L.circleMarker(e.latlng, { radius: 5, color: '#ff9800' }).addTo(map);
+}
+function onMapDblClick(e) {
+  if (drawPoints.length >= 3) {
+    fencePoints = drawPoints.slice();
+    drawFence(fencePoints, '#e07b00');
+  } else {
+    alert('至少需要 3 个顶点才能构成围栏，请继续点击地图。');
+    return;
+  }
+  stopDrawing();
+}
+function stopDrawing() {
+  drawing = false;
+  map.off('click', onMapClick);
+  map.off('dblclick', onMapDblClick);
+  document.getElementById('btnDraw').textContent = '✏️ 重新画围栏（点地图加顶点，双击闭合）';
+  updateAllCows();
+}
+
+// ---- 9. 按钮绑定 -------------------------------------------
+document.getElementById('btnDraw').addEventListener('click', startDrawing);
+document.getElementById('btnReset').addEventListener('click', restoreDefaultFence);
+document.getElementById('btnPause').addEventListener('click', function () {
+  paused = !paused;
+  this.textContent = paused ? '▶️ 继续移动' : '⏸ 暂停牛群移动';
+});
+
+// ---- 10. 启动 ----------------------------------------------
+restoreDefaultFence();
+createCowMarkers();
+updateAllCows();
+setInterval(moveCows, 1000); // 每秒移动一次 & 检测一次（模拟项圈上报频率）
+</script>
+</body>
+</html>
